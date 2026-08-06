@@ -243,4 +243,3 @@ All in `agent/config.py` unless noted. Key environment variables (`.env`):
 
 - [Model Context Protocol](https://modelcontextprotocol.io/) and its [Python SDK](https://github.com/modelcontextprotocol/python-sdk)
 - [OMDb API](https://www.omdbapi.com/) and [TMDb API](https://www.themoviedb.org/documentation/api)
-- The agent core (loop, MCP connection handling, LLM client abstraction) originated in a prior project, Repo Pulse, and was carried over largely unchanged — only the tool set and prompts are movie-domain-specific.
