@@ -5,11 +5,25 @@ import SuggestedPrompts from './SuggestedPrompts'
 import TypingIndicator from './TypingIndicator'
 import ToolCallIndicator from './ToolCallIndicator'
 import useWebSocket from '../hooks/useWebSocket'
+import { getSessionId, resetSessionId, API_BASE_URL } from '../lib/session'
+import { RotateCcw } from 'lucide-react'
+
+// Turns stored history (flat [{role, content}, ...] pairs, as persisted by
+// the backend's conversation store) into the shape MessageBubble expects.
+function historyToMessages(history) {
+  return history.map((turn, idx) => ({
+    id: `history-${idx}`,
+    role: turn.role,
+    content: turn.content,
+    timestamp: new Date(),
+  }))
+}
 
 export default function ChatContainer() {
   const [messages, setMessages] = useState([])
   const [isThinking, setIsThinking] = useState(false)
   const [currentToolCall, setCurrentToolCall] = useState(null)
+  const [isHistoryLoaded, setIsHistoryLoaded] = useState(false)
   const messagesEndRef = useRef(null)
   
   const { sendMessage, isConnected } = useWebSocket({
@@ -23,6 +37,38 @@ export default function ChatContainer() {
   useEffect(() => {
     scrollToBottom()
   }, [messages, isThinking, currentToolCall])
+
+  // Hydrate from durable history on mount, so a page refresh (or the
+  // WebSocket hook's auto-reconnect-with-backoff on a dropped connection)
+  // shows prior turns immediately instead of a blank chat while the socket
+  // handshake is still in flight.
+  useEffect(() => {
+    const sessionId = getSessionId()
+    fetch(`${API_BASE_URL}/api/history/${sessionId}`)
+      .then((res) => (res.ok ? res.json() : { history: [] }))
+      .then((data) => {
+        if (data.history?.length) {
+          setMessages(historyToMessages(data.history))
+        }
+      })
+      .catch((err) => console.error('Failed to load conversation history:', err))
+      .finally(() => setIsHistoryLoaded(true))
+  }, [])
+
+  const handleNewConversation = async () => {
+    const sessionId = getSessionId()
+    try {
+      await fetch(`${API_BASE_URL}/api/history/${sessionId}`, { method: 'DELETE' })
+    } catch (err) {
+      console.error('Failed to clear conversation history:', err)
+    }
+    // Drop the local session id entirely - the next WebSocket connection
+    // will have none to send, so the backend mints a fresh one and this
+    // becomes a genuinely new, empty conversation rather than reusing the
+    // (now-cleared) old id.
+    resetSessionId(null)
+    window.location.reload()
+  }
 
   const handleWebSocketMessage = (data) => {
     switch (data.type) {
@@ -106,9 +152,20 @@ export default function ChatContainer() {
 
   return (
     <div className="flex-1 flex flex-col max-w-6xl w-full mx-auto">
+      {messages.length > 0 && (
+        <div className="px-4 pt-2 flex justify-end">
+          <button
+            onClick={handleNewConversation}
+            className="flex items-center gap-1.5 text-xs text-gray-500 dark:text-gray-400 hover:text-gray-800 dark:hover:text-gray-200 transition-colors"
+          >
+            <RotateCcw className="w-3.5 h-3.5" />
+            New conversation
+          </button>
+        </div>
+      )}
       {/* Messages Area */}
       <div className="flex-1 overflow-y-auto px-4 py-6 space-y-4">
-        {messages.length === 0 ? (
+        {messages.length === 0 && !isHistoryLoaded ? null : messages.length === 0 ? (
           <div className="h-full flex items-center justify-center">
             <div className="text-center max-w-md">
               <h2 className="text-2xl font-bold text-gray-800 dark:text-gray-200 mb-2">

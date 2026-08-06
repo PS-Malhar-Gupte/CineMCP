@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from 'react'
+import { getSessionId, resetSessionId } from '../lib/session'
 
-const WS_URL = 'ws://localhost:8000/ws/chat'
+const WS_BASE_URL = 'ws://localhost:8000/ws/chat'
 
 export default function useWebSocket({ onMessage }) {
   const [isConnected, setIsConnected] = useState(false)
@@ -10,7 +11,13 @@ export default function useWebSocket({ onMessage }) {
 
   const connect = () => {
     try {
-      const ws = new WebSocket(WS_URL)
+      // Every connection - including auto-reconnects after a drop - sends
+      // the persisted session_id, so the backend can rehydrate this
+      // session's conversation history instead of starting blank. Without
+      // this, the exponential-backoff reconnect in onclose below would
+      // silently wipe multi-turn context on every wifi blip/tab sleep.
+      const sessionId = getSessionId()
+      const ws = new WebSocket(`${WS_BASE_URL}?session_id=${encodeURIComponent(sessionId)}`)
       
       ws.onopen = () => {
         console.log('WebSocket connected')
@@ -21,6 +28,12 @@ export default function useWebSocket({ onMessage }) {
       ws.onmessage = (event) => {
         try {
           const data = JSON.parse(event.data)
+          // The backend resolves/mints the session_id for this connection and
+          // echoes it back immediately after accept - persist it so a first-
+          // ever visit (no local id yet) still gets continuity from here on.
+          if (data.type === 'session' && data.session_id) {
+            resetSessionId(data.session_id)
+          }
           onMessage(data)
         } catch (error) {
           console.error('Failed to parse WebSocket message:', error)

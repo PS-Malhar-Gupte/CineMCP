@@ -12,6 +12,8 @@ Defines the LLM model, loop constraints, and prompts that guide the agent's
 behavior when answering questions about movies.
 """
 
+import os
+
 # LLM model to use
 # 
 # For local Ollama (no API key needed):
@@ -45,6 +47,36 @@ MAX_LOOP_ITERATIONS = 10
 
 # Maximum number of conversation turns (user + assistant pairs) to keep in history
 MAX_HISTORY_TURNS = 5
+
+# --- Storage backend (conversation history + answer cache) ---
+#
+# "local" — in-process/JSON-file storage, ephemeral per-process. Useful for
+#           offline dev or if Redis isn't available. No cross-session
+#           continuity for the web UI (each socket starts fresh).
+# "redis" — persists conversation history and the answer cache in Redis,
+#           keyed by session_id. Required for reconnect-safe conversation
+#           continuity in the web UI.
+MEMORY_BACKEND = os.getenv("MEMORY_BACKEND", "redis")
+REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+
+# How long a session's conversation history survives with no activity.
+# Refreshed (sliding) on every turn, so only truly abandoned sessions expire.
+CONVERSATION_TTL_SECONDS = int(os.getenv("CONVERSATION_TTL_SECONDS", str(24 * 60 * 60)))  # 24h
+
+# Answer-cache TTLs. Split because not all cached answers age the same way:
+# a plot summary for a 2010 film is stable forever, but "what's out this
+# week" is wrong within days. Tools in VOLATILE_CACHE_TOOLS mark an answer
+# as time-sensitive if any of them were used to produce it.
+CACHE_TTL_STABLE_SECONDS = int(os.getenv("CACHE_TTL_STABLE_SECONDS", str(7 * 24 * 60 * 60)))  # 7d
+CACHE_TTL_VOLATILE_SECONDS = int(os.getenv("CACHE_TTL_VOLATILE_SECONDS", str(60 * 60)))  # 1h
+
+VOLATILE_CACHE_TOOLS = {
+    "now_playing_india",
+    "upcoming_releases_india",
+    "upcoming_releases_global",
+    "recent_releases_global",
+    "recent_releases_india",
+}
 
 FALLBACK_EMPTY_RESULT = "I could not find any verified information for your request in the movie databases."
 FALLBACK_UNGROUNDED = "I found some information, but I cannot confidently verify the full answer from the available data. I have withheld the response to prevent providing incorrect facts."

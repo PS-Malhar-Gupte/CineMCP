@@ -7,10 +7,11 @@ Integrates with the existing agent logic.
 
 import asyncio
 import os
+import uuid
 from pathlib import Path
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, WebSocket, WebSocketDisconnect, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
 
@@ -23,29 +24,76 @@ load_dotenv(dotenv_path=env_path)
 import sys
 sys.path.insert(0, str(project_root))
 
-from agent.config import MODEL_NAME, MAX_LOOP_ITERATIONS, SYSTEM_PROMPT
+from agent.config import MODEL_NAME, MAX_LOOP_ITERATIONS, SYSTEM_PROMPT, MAX_HISTORY_TURNS
 from agent.mcp_connection import connect
 from agent.llm_client import decide, reflect
 from agent.loop import run_loop
 from agent.evaluation import EvaluationEngine
 from agent.observability import set_request_id, get_spans
+from agent.conversation import ConversationState
+from agent.conversation_store import get_conversation_store
+from agent.memory import get_memory_provider
 from web.backend.mcp_manager import MCPSessionManager
 from pydantic import BaseModel
 
 
 class ConnectionManager:
-    """Manages WebSocket connections and MCP session."""
+    """Manages WebSocket connections, per-connection conversation state, and the MCP session."""
     
     def __init__(self):
-        self.active_connections: list[WebSocket] = []
+        # Per-connection ConversationState is still used as the in-process
+        # working copy for building each turn's prompt, but the durable
+        # identity that survives a reconnect is session_id, not the
+        # WebSocket object - a dropped connection gets a *new*
+        # ConversationState here, but re-hydrates it from conversation_store
+        # using the client-supplied session_id (see connect_ws below), so
+        # multi-turn context survives the reconnect-with-backoff behavior
+        # the frontend already does.
+        self.connections: dict[WebSocket, dict] = {}
         self.mcp_manager = MCPSessionManager()
+        # Durable, TTL-aware, shared across CLI + all web connections/workers
+        # (Redis by default; falls back to the local JSON file if
+        # MEMORY_BACKEND=local or Redis is unreachable - see agent/memory.py
+        # and agent/conversation_store.py for the fallback logic).
+        memory_file = project_root / ".cine_memory.json"
+        self.memory_service = get_memory_provider(local_persist_path=str(memory_file))
+        self.conversation_store = get_conversation_store(max_turns=MAX_HISTORY_TURNS)
     
-    async def connect_ws(self, websocket: WebSocket):
+    async def connect_ws(self, websocket: WebSocket) -> str:
+        """
+        Accept the connection, resolve its session_id, and rehydrate
+        conversation history for that session. Returns the resolved
+        session_id so the caller can send it back to the client (important
+        when the server had to generate one - the client must persist it
+        to get continuity on the *next* connection).
+        """
         await websocket.accept()
-        self.active_connections.append(websocket)
+        # The frontend generates a session_id client-side (localStorage) and
+        # sends it as ?session_id=... so reconnects/refreshes resolve back
+        # to the same durable history. If it's ever missing (older client,
+        # direct API use, etc.) we mint one so the connection still works,
+        # just without continuity until the client starts sending it back.
+        session_id = websocket.query_params.get("session_id") or str(uuid.uuid4())
+        
+        conv_state = ConversationState(max_turns=MAX_HISTORY_TURNS)
+        stored_history = await self.conversation_store.get_history(session_id)
+        if stored_history:
+            conv_state.load(stored_history)
+        
+        self.connections[websocket] = {
+            "conv_state": conv_state,
+            "session_id": session_id
+        }
+        return session_id
     
     def disconnect(self, websocket: WebSocket):
-        self.active_connections.remove(websocket)
+        self.connections.pop(websocket, None)
+    
+    def get_conv_state(self, websocket: WebSocket) -> ConversationState:
+        return self.connections[websocket]["conv_state"]
+    
+    def get_session_id(self, websocket: WebSocket) -> str:
+        return self.connections[websocket]["session_id"]
     
     async def initialize_mcp(self):
         """Initialize MCP connection if not already connected."""
@@ -119,6 +167,24 @@ async def evaluate_response(req: EvaluateRequest):
     return {"metrics": metrics}
 
 
+@app.get("/api/history/{session_id}")
+async def get_history(session_id: str):
+    """
+    Return stored conversation turns for a session so the frontend can
+    hydrate the chat UI on page load, without waiting for the WebSocket
+    handshake and a first message round-trip.
+    """
+    history = await manager.conversation_store.get_history(session_id)
+    return {"session_id": session_id, "history": history}
+
+
+@app.delete("/api/history/{session_id}")
+async def clear_history(session_id: str):
+    """Clear stored history for a session (backs the frontend's 'New conversation' action)."""
+    await manager.conversation_store.clear(session_id)
+    return {"session_id": session_id, "cleared": True}
+
+
 @app.websocket("/ws/chat")
 async def websocket_endpoint(websocket: WebSocket):
     """
@@ -129,7 +195,13 @@ async def websocket_endpoint(websocket: WebSocket):
     - To client: {"type": "thinking"} | {"type": "tool_call", "tool": "...", "args": {...}} | 
                  {"type": "tool_result", "result": "..."} | {"type": "response", "content": "..."}
     """
-    await manager.connect_ws(websocket)
+    session_id = await manager.connect_ws(websocket)
+    # Tell the client which session_id this connection resolved to - it
+    # must persist this (localStorage) so a future reconnect/refresh sends
+    # it back and gets the same conversation history. Doing this before
+    # the first message means even a client that had no session_id yet
+    # (first-ever visit) is covered from the very first turn.
+    await manager.send_message(websocket, {"type": "session", "session_id": session_id})
     
     try:
         while True:
@@ -146,8 +218,26 @@ async def websocket_endpoint(websocket: WebSocket):
             # Set request ID for tracing
             set_request_id()
             
+            conv_state = manager.get_conv_state(websocket)
+            session_id = manager.get_session_id(websocket)
+            
             # Send thinking indicator
             await manager.send_message(websocket, {"type": "thinking"})
+            
+            # Check memory cache for an exact repeat of this question before
+            # running the full agent loop - mirrors agent/main.py's CLI
+            # behavior, and shares the same underlying Redis/local cache.
+            cache_key = manager.memory_service.generate_key(user_message)
+            cached_answer = await manager.memory_service.get(session_id, cache_key)
+            if cached_answer:
+                conv_state.add_turn(user_message, cached_answer)
+                await manager.conversation_store.append_turn(session_id, user_message, cached_answer)
+                await manager.send_message(websocket, {
+                    "type": "response",
+                    "content": cached_answer,
+                    "cached": True
+                })
+                continue
             
             # Define step callback to send real-time updates
             async def send_step(step_type: str, step_data: dict):
@@ -169,35 +259,59 @@ async def websocket_endpoint(websocket: WebSocket):
                     })
             
             try:
-                # Run the agent loop with checked out session
-                async with manager.mcp_manager.get_session() as session:
-                    draft_answer, full_conversation = await run_loop(
-                        session=session,
-                        user_message=user_message,
-                        system_prompt=SYSTEM_PROMPT,
-                        model_name=MODEL_NAME,
-                        max_iterations=MAX_LOOP_ITERATIONS,
-                        decide_fn=decide,
-                        on_step=send_step
-                    )
-                
-                # One-shot reflection pass
-                history = full_conversation + [
-                    {"role": "assistant", "content": draft_answer}
-                ]
-                
-                reflection_result = await asyncio.to_thread(reflect, history, draft_answer, MODEL_NAME)
-                
-                if reflection_result.get("ok"):
-                    final_answer = draft_answer
-                else:
-                    corrected = reflection_result.get("corrected_answer", draft_answer)
-                    meta_keywords = ["please call", "original answer", "general knowledge", "should be based on", "tool call", "direct tool call"]
-                    if any(kw in str(corrected).lower() for kw in meta_keywords):
-                        final_answer = draft_answer
+                # Wrapped in a hard timeout as defense-in-depth: without this,
+                # a hung MCP session checkout (e.g. pool exhaustion - a prior
+                # request's session never returned to the queue) or a runaway
+                # chain of LLM retries could block this request indefinitely
+                # with no way to recover except a page refresh, since nothing
+                # else in this handler would ever time out on its own.
+                async def _run_agent_turn():
+                    # Run the agent loop with checked out session
+                    async with manager.mcp_manager.get_session() as session:
+                        draft_answer, full_conversation, tools_used = await run_loop(
+                            session=session,
+                            user_message=user_message,
+                            system_prompt=SYSTEM_PROMPT,
+                            model_name=MODEL_NAME,
+                            max_iterations=MAX_LOOP_ITERATIONS,
+                            decide_fn=decide,
+                            on_step=send_step,
+                            chat_history=conv_state.get_history()
+                        )
+
+                    # One-shot reflection pass
+                    history = full_conversation + [
+                        {"role": "assistant", "content": draft_answer}
+                    ]
+
+                    reflection_result = await asyncio.to_thread(reflect, history, draft_answer, MODEL_NAME)
+
+                    if reflection_result.get("ok"):
+                        resolved_answer = draft_answer
                     else:
-                        final_answer = corrected
-                
+                        corrected = reflection_result.get("corrected_answer", draft_answer)
+                        meta_keywords = ["please call", "original answer", "general knowledge", "should be based on", "tool call", "direct tool call"]
+                        if any(kw in str(corrected).lower() for kw in meta_keywords):
+                            resolved_answer = draft_answer
+                        else:
+                            resolved_answer = corrected
+
+                    return resolved_answer, tools_used
+
+                final_answer, tools_used = await asyncio.wait_for(_run_agent_turn(), timeout=180)
+
+                # Save the turn to this connection's conversation history
+                # (in-process, for the next prompt on *this* connection) and
+                # to the durable conversation store (so a reconnect under
+                # the same session_id picks it up even on a fresh
+                # ConnectionManager entry). Cache write is skipped
+                # internally for fallback/error answers - see
+                # agent/memory.py.is_cacheable - and TTL is picked based on
+                # whether a date-sensitive tool contributed to the answer.
+                conv_state.add_turn(user_message, final_answer)
+                await manager.conversation_store.append_turn(session_id, user_message, final_answer)
+                await manager.memory_service.set(session_id, cache_key, final_answer, tools_used=tools_used)
+
                 # capture spans NOW while still in the main request context
                 current_spans = get_spans()
                 
@@ -222,12 +336,29 @@ async def websocket_endpoint(websocket: WebSocket):
                 asyncio.create_task(emit_eval(current_spans))
 
                 
-            except RuntimeError as e:
-                # Max iterations or other error
-                await manager.send_message(websocket, {
-                    "type": "error",
-                    "content": str(e)
-                })
+            except Exception as e:
+                # Previously this only caught RuntimeError - anything else
+                # (a requests.exceptions.Timeout/ConnectionError from a slow
+                # or dropped Groq call, an MCP session error, etc.) propagated
+                # straight out of this handler uncaught. That crashed the
+                # request silently: no "error" message ever reached the
+                # frontend, so isThinking/currentToolCall in ChatContainer
+                # never got cleared and the UI was stuck on the typing
+                # indicator with no way to recover short of a page refresh.
+                # Catching Exception broadly here guarantees the frontend
+                # always gets a message back, whatever actually went wrong.
+                print(f"[WebSocket] Unhandled error while processing message: {type(e).__name__}: {e}")
+                import traceback
+                traceback.print_exc()
+                try:
+                    await manager.send_message(websocket, {
+                        "type": "error",
+                        "content": f"Something went wrong processing that request ({type(e).__name__}). Please try again."
+                    })
+                except Exception:
+                    # If we can't even send on this socket, it's already dead -
+                    # nothing more to do for this iteration.
+                    pass
     
     except WebSocketDisconnect:
         manager.disconnect(websocket)

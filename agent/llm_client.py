@@ -50,6 +50,13 @@ class OpenAICompatibleProvider(LLMProvider):
         self.max_retries = max_retries
     
     def call(self, messages: List[Dict[str, str]]) -> str:
+        # Start at the configured max_tokens; on a 413 "request too large"
+        # (a TPM ceiling counting prompt + reserved completion tokens, not
+        # a retryable rate limit), progressively ask for less completion
+        # budget instead of immediately giving up to the fallback provider.
+        current_max_tokens = 1024
+        min_max_tokens = 200
+
         for attempt in range(self.max_retries):
             response = requests.post(
                 f"{self.base_url}/chat/completions",
@@ -61,7 +68,7 @@ class OpenAICompatibleProvider(LLMProvider):
                     "model": self.model_name,
                     "messages": messages,
                     "temperature": 0.7,
-                    "max_tokens": 2000
+                    "max_tokens": current_max_tokens
                 },
                 timeout=120
             )
@@ -70,6 +77,20 @@ class OpenAICompatibleProvider(LLMProvider):
                 retry_after = response.headers.get("Retry-After")
                 wait_seconds = float(retry_after) if retry_after else (2 ** (attempt + 1))
                 time.sleep(wait_seconds)
+                continue
+
+            if response.status_code == 413 and current_max_tokens > min_max_tokens and attempt < self.max_retries - 1:
+                # Groq's free tier counts (prompt tokens + max_tokens
+                # reserved) toward its TPM ceiling. A long system prompt or
+                # a conversation that's grown across several tool-call
+                # iterations can tip a request over that limit even with a
+                # modest max_tokens. Halving it and retrying immediately
+                # (no sleep needed - this isn't a rate-limit cooldown, it's
+                # a request-shape problem) recovers most of these without
+                # ever falling through to the (possibly unconfigured) local
+                # Ollama fallback.
+                current_max_tokens = max(min_max_tokens, current_max_tokens // 2)
+                print(f"[LLM Retry] 413 too-large - retrying with max_tokens={current_max_tokens}")
                 continue
 
             if response.status_code >= 400:
@@ -238,6 +259,11 @@ def validate_grounding(history: list[dict[str, str]], draft_answer: str, model_n
             f"It is OK if the draft answer paraphrases the plot or uses common sense formatting, as long as it doesn't invent entirely new, unsupported facts (like fake sequels or wrong actors).\n"
             f"If the answer contains major fabrications not supported by the Tool Results, it is NOT grounded.\n"
             f"If the answer is a general greeting, clarifying question, or accurately reflects the tool data, it IS grounded.\n"
+            f"IMPORTANT: default to is_grounded=true unless you can point to a SPECIFIC sentence that states a concrete fact "
+            f"(a title, date, name, or number) with no matching support anywhere in the tool results. Minor rewording, "
+            f"summarizing, or well-known general context about a famous film is NOT a fabrication - do not reject an answer "
+            f"just because it adds reasonable framing on top of the tool data. When genuinely unsure, prefer true over false: "
+            f"a wrongly-approved answer is far less harmful to the user than wrongly discarding a correct, well-supported one.\n"
             f"Return {{\"is_grounded\": true, \"unsupported_claims\": []}} if it passes, or {{\"is_grounded\": false, \"unsupported_claims\": [\"claim 1\", ...]}} if it fails."
         )
     }
@@ -252,6 +278,13 @@ def validate_grounding(history: list[dict[str, str]], draft_answer: str, model_n
     try:
         parsed = _extract_first_json(response)
         validation = GroundingValidationModel.model_validate(parsed)
+        if not validation.is_grounded:
+            # Previously this reason was computed and then discarded, making
+            # every FALLBACK_UNGROUNDED response undebuggable - there was no
+            # way to tell whether the judge caught a real fabrication or
+            # just misjudged a well-supported answer (e.g. a false positive
+            # on a well-known movie). Surface it so it's visible in logs.
+            print(f"[Grounding] Rejected as ungrounded. Unsupported claims: {validation.unsupported_claims}")
         return validation.is_grounded
     except (ValueError, ValidationError) as e:
         raise RuntimeError(f"LLM grounding validation failed: {str(e)}\nRaw response: {response}") from e
@@ -261,37 +294,82 @@ def _extract_first_json(text: str) -> dict[str, Any]:
     """
     Tolerantly extract the first valid JSON object from text.
     Raises ValueError if a valid JSON object cannot be found.
+
+    This is string-aware: brace characters that appear INSIDE a JSON string
+    value (e.g. a movie title quoted mid-sentence, or any '{'/'}' in prose)
+    no longer affect the depth count. The previous version tracked braces
+    naively across the whole text, so a stray/unescaped quote inside the
+    model's answer could desync the counter and produce a false 'unbalanced'
+    result even when the real JSON object was well-formed.
+
+    It also never discards the position of the first '{' once found - the
+    previous version reset start_idx to None the moment ANY candidate slice
+    failed to parse, which silently disabled the truncation-repair fallback
+    below it (the repair path only runs `if start_idx is not None`).
     """
     text = re.sub(r'```(?:json)?\s*', '', text)
     text = text.strip()
-    
-    stack = []
-    start_idx = None
-    
-    for i, char in enumerate(text):
-        if char == '{':
-            if not stack:
-                start_idx = i
-            stack.append(char)
-        elif char == '}':
-            if stack:
-                stack.pop()
-                if not stack and start_idx is not None:
-                    candidate = text[start_idx:i+1]
-                    try:
-                        return json.loads(candidate)
-                    except json.JSONDecodeError:
-                        start_idx = None
-    
+
+    # Fast path: well-formed responses parse immediately, no scanning needed.
     try:
         return json.loads(text)
-    except json.JSONDecodeError as e:
-        # Attempt to repair common truncated JSON outputs
-        if start_idx is not None:
-            candidate = text[start_idx:]
-            for repair in ['}', '"}', '"]}']:
+    except json.JSONDecodeError:
+        pass
+
+    first_open = None
+    balanced_candidate = None
+    depth = 0
+    in_string = False
+    escape = False
+
+    for i, char in enumerate(text):
+        if in_string:
+            if escape:
+                escape = False
+            elif char == '\\':
+                escape = True
+            elif char == '"':
+                in_string = False
+            continue
+
+        if char == '"':
+            in_string = True
+        elif char == '{':
+            if depth == 0:
+                first_open = i if first_open is None else first_open
+                candidate_start = i
+            depth += 1
+        elif char == '}':
+            if depth > 0:
+                depth -= 1
+                if depth == 0 and balanced_candidate is None:
+                    balanced_candidate = text[candidate_start:i + 1]
+
+    if balanced_candidate is not None:
+        try:
+            return json.loads(balanced_candidate)
+        except json.JSONDecodeError:
+            pass  # fall through to truncation repair below
+
+    # Truncation repair: the response likely got cut off (e.g. hit max_tokens
+    # mid-string) before ever closing its braces. Try trimming any trailing
+    # partial token and appending plausible closing punctuation.
+    if first_open is not None:
+        tail = text[first_open:]
+        for repair in ['"}', '"]}', '}', ']}']:
+            try:
+                return json.loads(tail + repair)
+            except json.JSONDecodeError:
+                continue
+        # Last resort: drop back to the last comma (likely the last complete
+        # key/value pair) before appending closing punctuation.
+        last_comma = tail.rfind(',')
+        if last_comma > 0:
+            trimmed = tail[:last_comma]
+            for repair in ['}', ']}']:
                 try:
-                    return json.loads(candidate + repair)
+                    return json.loads(trimmed + repair)
                 except json.JSONDecodeError:
                     continue
-        raise ValueError(f"Could not extract valid JSON from response: {text}") from e
+
+    raise ValueError(f"Could not extract valid JSON from response: {text}")

@@ -16,6 +16,15 @@ class ConversationState:
         self.max_turns = max_turns
         self.history: List[Dict[str, str]] = []
 
+    def load(self, history: List[Dict[str, str]]) -> None:
+        """
+        Replace the current history with previously-stored turns (e.g. from
+        a conversation store), applying the same truncation rule as
+        add_turn so a long stored history can't bypass max_turns.
+        """
+        max_messages = self.max_turns * 2
+        self.history = list(history)[-max_messages:] if history else []
+
     def add_turn(self, user_msg: str, assistant_msg: str) -> None:
         """
         Append a completed interaction turn to the history.

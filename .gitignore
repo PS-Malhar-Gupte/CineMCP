@@ -54,7 +54,8 @@ out/
 *.swo
 *~
 
-# Test files (manual test scripts)
+# Test files (manual/ad-hoc debug scripts at the project root - NOT the
+# real automated suite in tests/, which is explicitly un-ignored below)
 test_*.py
 *_test.py
 run_test_*.py
@@ -65,6 +66,11 @@ TESTING_*.md
 TEST_*.md
 MANUAL_*.md
 TASK_*_SUMMARY.md
+
+# The tests/ directory holds real unittest suites (test_phase1.py,
+# test_memory_and_conversation.py) - without this negation, the test_*.py
+# pattern above would silently exclude them from every commit.
+!tests/*.py
 
 # OS
 .DS_Store

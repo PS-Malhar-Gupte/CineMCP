@@ -32,7 +32,8 @@ from agent.mcp_connection import connect
 from agent.llm_client import decide, reflect
 from agent.loop import run_loop
 from agent.conversation import ConversationState
-from agent.memory import LocalMemoryService
+from agent.conversation_store import get_conversation_store
+from agent.memory import get_memory_provider
 from agent.observability import set_request_id
 
 
@@ -76,11 +77,25 @@ async def main():
             
         print(f"Welcome, {user_id}!\n", file=sys.stderr)
         
-        # Initialize conversation state and memory service
+        # Initialize conversation state and memory service.
+        #
+        # The username the person just entered doubles as their session_id:
+        # it's the one identifier that's stable across separate CLI runs,
+        # so using it as the conversation-store key means running
+        # `python -m agent.main` again as the same user picks up right
+        # where the last session left off (same continuity guarantee the
+        # web UI gets from its localStorage-held session_id).
+        session_id = user_id
         conv_state = ConversationState(max_turns=MAX_HISTORY_TURNS)
-        # Using a local JSON file to persist memory across sessions
+        conversation_store = get_conversation_store(max_turns=MAX_HISTORY_TURNS)
+        stored_history = await conversation_store.get_history(session_id)
+        if stored_history:
+            conv_state.load(stored_history)
+            print(f"(Resumed previous conversation - {len(stored_history) // 2} prior turn(s) loaded)\n", file=sys.stderr)
+        # Falls back to a local JSON file (.cine_memory.json) if
+        # MEMORY_BACKEND=local or Redis isn't reachable - see agent/memory.py.
         memory_file = project_root / ".cine_memory.json"
-        memory_service = LocalMemoryService(persist_path=str(memory_file))
+        memory_service = get_memory_provider(local_persist_path=str(memory_file))
         
         # Interactive loop
         while True:
@@ -99,12 +114,13 @@ async def main():
                 
                 # Check for cached answer
                 cache_key = memory_service.generate_key(user_message)
-                cached_answer = memory_service.get(user_id, cache_key)
+                cached_answer = await memory_service.get(session_id, cache_key)
                 if cached_answer:
                     print("\n  [Memory] Found cached answer for this exact question:", file=sys.stderr)
                     print(f"\n{cached_answer}\n")
                     # Still add to conversation state so context isn't broken
                     conv_state.add_turn(user_message, cached_answer)
+                    await conversation_store.append_turn(session_id, user_message, cached_answer)
                     continue
                 
                 # Run the agent loop for this user turn
@@ -123,7 +139,7 @@ async def main():
                             print(f"  ✗ {data['error']}", file=sys.stderr)
                     
                     # Run the decide → act → observe loop
-                    draft_answer, full_conversation = await run_loop(
+                    draft_answer, full_conversation, tools_used = await run_loop(
                         session=session,
                         user_message=user_message,
                         system_prompt=SYSTEM_PROMPT,
@@ -157,11 +173,16 @@ async def main():
                         final_answer = reflection_result.get("corrected_answer", draft_answer)
                         print("  ✓ Answer corrected", file=sys.stderr)
                     
-                    # Save the turn to conversation state
+                    # Save the turn to conversation state (in-process, for
+                    # building this session's next prompt) and to the
+                    # durable conversation store (so it survives a
+                    # restart/reconnect under the same session_id).
                     conv_state.add_turn(user_message, final_answer)
+                    await conversation_store.append_turn(session_id, user_message, final_answer)
                     
-                    # Cache the answer
-                    memory_service.set(user_id, cache_key, final_answer)
+                    # Cache the answer (skipped internally if it's a
+                    # fallback/error answer - see agent/memory.py.is_cacheable)
+                    await memory_service.set(session_id, cache_key, final_answer, tools_used=tools_used)
                     
                     # Print the final answer to stdout (clean output for scripting)
                     print(f"\n{final_answer}\n")

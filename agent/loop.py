@@ -34,9 +34,14 @@ async def _run_loop_inner(
     decide_fn: Callable,
     on_step: Callable[[str, dict], None] | None = None,
     chat_history: list[dict] | None = None
-) -> tuple[str, list[dict]]:
+) -> tuple[str, list[dict], list[str]]:
     """
     Run the agent's decide → act → observe loop.
+
+    Returns (final_answer, full_conversation, tools_used) - tools_used is
+    the ordered list of tool names actually called this turn, so callers
+    (e.g. the answer cache) can decide things like cache TTL based on
+    whether any date-sensitive tool contributed to the answer.
     """
     if on_step is None:
         on_step = _default_step_handler
@@ -50,6 +55,7 @@ async def _run_loop_inner(
     
     called_any_tools = False
     has_valid_data = False
+    tools_used: list[str] = []
     
     for iteration in range(max_iterations):
         # Decide: call LLM to get next action (in thread if sync to avoid blocking event loop)
@@ -81,7 +87,7 @@ async def _run_loop_inner(
                     answer = FALLBACK_UNGROUNDED
             
             await _notify_step(on_step, "final", {"answer": answer})
-            return answer, conversation
+            return answer, conversation, tools_used
         
         elif action == "call_tool":
             # Agent wants to call a tool
@@ -89,6 +95,7 @@ async def _run_loop_inner(
             tool_args = decision.get("arguments", {})
             
             await _notify_step(on_step, "tool_call", {"tool": tool_name, "arguments": tool_args})
+            tools_used.append(tool_name)
             
             # Execute the tool call
             try:

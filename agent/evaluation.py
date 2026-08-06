@@ -49,7 +49,7 @@ class LLMMetric(Metric):
         """The prompt template used for scoring. Should ask for JSON {"score": float}."""
         pass
         
-    async def evaluate(self, user_query: str, agent_response: str, context: Optional[str] = None) -> float:
+    async def evaluate(self, user_query: str, agent_response: str, context: Optional[str] = None) -> Optional[float]:
         prompt = self.prompt_template.format(
             query=user_query,
             response=agent_response,
@@ -68,8 +68,15 @@ class LLMMetric(Metric):
             # Ensure score is between 0 and 1
             return max(0.0, min(1.0, score_data.score))
         except Exception as e:
+            # Previously returned 0.0 here, which is indistinguishable from
+            # a real judge decision that the response is completely
+            # irrelevant/imprecise. A rate limit, timeout, or JSON-parse
+            # failure on this ONE metric's own LLM call would silently show
+            # up in the UI as a confident-looking "0%" score, when it
+            # actually means "we don't know - this metric failed to run".
+            # Returning None lets callers (and the UI) distinguish the two.
             print(f"Error evaluating {self.name}: {e}")
-            return 0.0
+            return None
 
 
 class RelevanceMetric(LLMMetric):
@@ -156,14 +163,23 @@ class EvaluationEngine:
         """Easily add new metrics to the evaluation engine."""
         self.metrics.append(metric)
         
-    async def evaluate_all(self, user_query: str, agent_response: str, context: Optional[str] = None) -> Dict[str, float]:
-        """Runs all metrics concurrently and returns a dictionary of scores."""
-        tasks = [
-            metric.evaluate(user_query, agent_response, context)
-            for metric in self.metrics
-        ]
-        
-        results = await asyncio.gather(*tasks)
+    async def evaluate_all(self, user_query: str, agent_response: str, context: Optional[str] = None) -> Dict[str, Optional[float]]:
+        """
+        Runs all metrics and returns a dictionary of scores.
+
+        Previously these ran fully concurrently via asyncio.gather. Since
+        this method is only ever invoked from a background task AFTER the
+        user's answer has already been sent (see web/backend/main.py's
+        emit_eval), there is no user-facing latency cost to running them
+        sequentially instead - and doing so meaningfully reduces the odds
+        of 4 near-simultaneous Groq calls colliding with the account's
+        shared per-minute token/request budget right after the main answer
+        already spent part of it.
+        """
+        results = []
+        for metric in self.metrics:
+            score = await metric.evaluate(user_query, agent_response, context)
+            results.append(score)
         
         return {
             metric.name: score 
